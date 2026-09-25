@@ -18,6 +18,7 @@ FRED={
  'SP500':('S&P 500','Equity indices','index','return', 'daily'),
  'NASDAQCOM':('Nasdaq Composite','Equity indices','index','return','daily'),
  'DJIA':('Dow Jones Industrial Average','Equity indices','index','return','daily'),
+ 'NASDAQ100':('Nasdaq-100','Equity indices','index','return','daily'),
  'DGS2':('2-year Treasury yield','Rates','%','level','daily'),
  'DGS3':('3-year Treasury yield','Rates','%','level','daily'),
  'DGS5':('5-year Treasury yield','Rates','%','level','daily'),
@@ -46,8 +47,14 @@ FRED={
  'DEXCAUS':('USD/CAD','FX','CAD per USD','both','daily'),
  'DEXCHUS':('USD/CNY','FX','CNY per USD','both','daily'),
  'DEXMXUS':('USD/MXN','FX','MXN per USD','both','daily'),
+ 'DEXSZUS':('USD/CHF','FX','CHF per USD','both','daily'),
+ 'DEXUSAL':('AUD/USD','FX','USD per AUD','both','daily'),
  'DCOILWTICO':('WTI crude oil','Commodities','USD/barrel','both','daily'),
  'DCOILBRENTEU':('Brent crude oil','Commodities','USD/barrel','both','daily'),
+ 'DHHNGSP':('Henry Hub natural gas spot price','Commodities','USD/MMBtu','both','daily'),
+ 'PCOPPUSDM':('Global copper price (IMF monthly)','Commodities','USD/metric ton','both','monthly'),
+ 'CSUSHPINSA':('Case-Shiller U.S. National Home Price Index (NSA)','Housing','index','change','monthly'),
+ 'HPIPONM226N':('FHFA U.S. Purchase-Only Home Price Index (NSA)','Housing','index','change','monthly'),
 }
 # OECD national share-price indexes via FRED: these are NOT MSCI benchmarks or USD returns.
 INTERNATIONAL={
@@ -58,7 +65,7 @@ INTERNATIONAL={
 FRED.update(INTERNATIONAL)
 MSCI={}
 CAT={**FRED,**MSCI}
-WEIGHTS={'Equity indices':18,'International indices':10,'Rates':20,'Macro':12,'Inflation':14,'FX':10,'Commodities':12,'Individual stocks':20,'Bond indices':6,'Crypto':4}
+WEIGHTS={'Equity indices':18,'International indices':10,'Rates':20,'Macro':12,'Inflation':14,'FX':10,'Commodities':12,'Housing':7,'Individual stocks':20,'Bond indices':6,'Crypto':4}
 LOCK=threading.RLock()
 
 def conn():
@@ -161,11 +168,11 @@ def question_for(s,rows,slot,day):
  if slot==1:
   endtarget=day-timedelta(days=1);months=None
  else:
-  months={2:1,3:6,4:12,5:60}[slot];endtarget=shift(day,-months)
+  months={2:1,3:6,4:12,5:60}[slot];endtarget=day-timedelta(days=1)
  e=previous(rows,endtarget)
  if e is None:return None
  enddate,endval=rows[e]
- if (endtarget-enddate).days>({'daily':7,'weekly':15,'monthly':55,'quarterly':115}[freq]):return None
+ if (endtarget-enddate).days>({'daily':7,'weekly':15,'monthly':90,'quarterly':180}[freq]):return None
  # Return questions require previous session (Q1) or a horizon-matched starting point.
  isreturn=kind=='return' or (kind=='both' and (slot==1 or slot>=3))
  ischange=kind=='change'
@@ -174,7 +181,7 @@ def question_for(s,rows,slot,day):
  if isreturn or ischange:
   if slot==1:st=e-1
   else:
-   target=shift(endtarget,-months)
+   target=shift(enddate,-months)
    st=previous(rows,target)
   if st is None or st>=e:return None
   start,startval=rows[st]
@@ -192,6 +199,7 @@ def question_for(s,rows,slot,day):
   tol={2:2,3:4,4:6,5:15}.get(slot,2)
   if group=='Inflation':tol={2:.3,3:.4,4:.7,5:2}.get(slot,.4)
   if group=='Macro':tol={2:1,3:2,4:3,5:6}.get(slot,2)
+  if group=='Housing':tol={2:.5,3:2,4:4,5:12}.get(slot,2)
   if group=='FX':tol*=.65
   if group=='Commodities':tol*=1.7
  elif typ=='rate_level':tol=.5
@@ -209,10 +217,11 @@ def question_for(s,rows,slot,day):
  return {'slot':slot,'series':s,'name':name,'group':group,'question':question,'type':typ,'unit':ansunit,'answer':answer,'display':round(answer,2 if ansunit=='%' else (4 if group=='FX' else 2)),'precision':2 if ansunit=='%' else (4 if group=='FX' else 2),'tolerance':tol,'end':enddate.isoformat(),'start':start.isoformat() if start else None,'endValue':endval,'startValue':startval,'chart':chart,'source':None}
 
 def generate(day,mode):
+ storage_mode='v2-latest-end-'+mode
  with LOCK:
   c=conn()
   try:
-   saved=c.execute('SELECT payload FROM games WHERE day=? AND mode=?',(day.isoformat(),mode)).fetchone()
+   saved=c.execute('SELECT payload FROM games WHERE day=? AND mode=?',(day.isoformat(),storage_mode)).fetchone()
    if saved:return json.loads(saved['payload'])
    pools={};cache={}
    for s in CAT:
@@ -222,7 +231,7 @@ def generate(day,mode):
     cache[s]=rows
    # cooldown based on past published real/demo games, never current game selections
    recent={}
-   for row in c.execute('SELECT day,payload FROM games WHERE mode=? AND day<? AND day>=?',(mode,day.isoformat(),(day-timedelta(days=7)).isoformat())):
+   for row in c.execute('SELECT day,payload FROM games WHERE mode=? AND day<? AND day>=?',(storage_mode,day.isoformat(),(day-timedelta(days=7)).isoformat())):
     age=(day-date.fromisoformat(row['day'])).days
     for q in json.loads(row['payload'])['questions']:
      recent[q['series']]=min(age,recent.get(q['series'],999))
@@ -236,14 +245,14 @@ def generate(day,mode):
      pool.append((q,weight))
     if not pool:raise ValueError(f'No eligible real-data questions for Q{slot}. Refresh FRED data or import historical CSVs.')
     pools[slot]=pool
-   rng=random.Random(f'financia.le-v1:{mode}:{day.isoformat()}')
+   rng=random.Random(f'financia.le-v2:{mode}:{day.isoformat()}')
    questions=[]
    for slot in range(1,6):
     pool=pools[slot];q=rng.choices([x[0] for x in pool],weights=[x[1] for x in pool],k=1)[0]
     q['source']='SIMULATED DEMO' if mode=='demo' else ('OECD via FRED (national index, local-market basis)' if q['series'] in INTERNATIONAL else 'FRED (source series: '+q['series']+')')
     questions.append(q)
-   result={'date':day.isoformat(),'mode':mode,'questions':questions,'created':iso_now(),'version':1}
-   c.execute('INSERT INTO games VALUES(?,?,?,?)',(day.isoformat(),mode,json.dumps(result,allow_nan=False),iso_now()));c.commit()
+   result={'date':day.isoformat(),'mode':mode,'questions':questions,'created':iso_now(),'version':2}
+   c.execute('INSERT INTO games VALUES(?,?,?,?)',(day.isoformat(),storage_mode,json.dumps(result,allow_nan=False),iso_now()));c.commit()
    return result
   finally:c.close()
 
@@ -329,6 +338,8 @@ def main():
     assert q['end']<d.isoformat()
     assert q['slot'] in range(1,6)
     if q['start']:assert q['start']<q['end']
+    if q['type'] in ('period_return','calculated_change'):
+     assert q['end']==max(x[0] for x in fixture_rows(q['series'],d) if x[0]<d).isoformat()
   print('PASS: 30 frozen demo games, 150 valid questions');return
  port=int(os.getenv('PORT','8765'));server=ThreadingHTTPServer((os.getenv('HOST','0.0.0.0'),port),Handler)
  threading.Thread(target=periodic_refresh,daemon=True).start()
