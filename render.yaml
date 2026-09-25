@@ -2,17 +2,13 @@ services:
   - type: web
     name: financia-le-private
     runtime: python
-    plan: starter
+    plan: free
     buildCommand: "python3 -m py_compile app.py"
     startCommand: "python3 app.py"
     healthCheckPath: /health
-    disk:
-      name: financia-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: FINANCIA_DB
-        value: /var/data/financia.db
+        value: /tmp/financia.db
       - key: FINANCIA_USER
         sync: false
       - key: FINANCIA_PASSWORD
