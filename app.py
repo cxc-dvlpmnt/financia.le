@@ -63,9 +63,48 @@ INTERNATIONAL={
  'SPASTT01KRM661N':('Korea share-price index (OECD)','International indices','index','change','monthly'),
 }
 FRED.update(INTERNATIONAL)
+# Stooq daily close data. These are explicitly named stocks/ETFs, not proprietary index returns.
+# Stock/ETF Close is NOT assumed dividend-adjusted; label and provenance reflect that.
+STOOQ_TICKERS={
+ 'AAPL':'Apple','MSFT':'Microsoft','NVDA':'NVIDIA','AMZN':'Amazon','GOOGL':'Alphabet (Class A)',
+ 'META':'Meta Platforms','BRK.B':'Berkshire Hathaway (Class B)','AVGO':'Broadcom','TSLA':'Tesla',
+ 'JPM':'JPMorgan Chase','WMT':'Walmart','LLY':'Eli Lilly','V':'Visa','MA':'Mastercard',
+ 'NFLX':'Netflix','COST':'Costco','XOM':'Exxon Mobil','JNJ':'Johnson & Johnson','PG':'Procter & Gamble',
+ 'HD':'Home Depot','ABBV':'AbbVie','BAC':'Bank of America','KO':'Coca-Cola','CVX':'Chevron',
+ 'ORCL':'Oracle','CRM':'Salesforce','AMD':'AMD','CSCO':'Cisco','IBM':'IBM','GE':'GE Aerospace',
+ 'CAT':'Caterpillar','MCD':'McDonald’s','UNH':'UnitedHealth','DIS':'Disney','PEP':'PepsiCo',
+ 'ABT':'Abbott Laboratories','MRK':'Merck','GS':'Goldman Sachs','MS':'Morgan Stanley',
+ 'AXP':'American Express','TMO':'Thermo Fisher','ISRG':'Intuitive Surgical','QCOM':'Qualcomm',
+ 'INTU':'Intuit','TXN':'Texas Instruments','AMGN':'Amgen','NOW':'ServiceNow',
+ 'UBER':'Uber','BKNG':'Booking Holdings','SPGI':'S&P Global',
+}
+# Frozen illustrative US-company universe; NOT claimed to be the actual top 50 by market cap.
+STOOQ_ETFS={
+ 'EFA':('iShares MSCI EAFE ETF','International ETFs'),
+ 'EEM':('iShares MSCI Emerging Markets ETF','International ETFs'),
+ 'URTH':('iShares MSCI World ETF','International ETFs'),
+ 'ACWI':('iShares MSCI ACWI ETF','International ETFs'),
+ 'VEU':('Vanguard FTSE All-World ex-US ETF','International ETFs'),
+ 'AGG':('iShares Core U.S. Aggregate Bond ETF','Bond ETFs'),
+ 'BND':('Vanguard Total Bond Market ETF','Bond ETFs'),
+ 'TLT':('iShares 20+ Year Treasury Bond ETF','Bond ETFs'),
+ 'LQD':('iShares iBoxx $ Investment Grade Corporate Bond ETF','Bond ETFs'),
+ 'HYG':('iShares iBoxx $ High Yield Corporate Bond ETF','Bond ETFs'),
+ 'MBB':('iShares MBS ETF','Bond ETFs'),
+ 'GLD':('SPDR Gold Shares ETF','Commodity ETFs'),
+ 'SLV':('iShares Silver Trust ETF','Commodity ETFs'),
+ 'PPLT':('abrdn Physical Platinum Shares ETF','Commodity ETFs'),
+}
+STOOQ={}
+STOOQ.update({'STOCK_'+k:(v+' stock closing-price return','Individual stocks','index','return','daily') for k,v in STOOQ_TICKERS.items()})
+STOOQ.update({'ETF_'+k:(v+' closing-price return',group,'index','return','daily') for k,(v,group) in STOOQ_ETFS.items()})
+CRYPTO={
+ 'KRAKEN_BTCUSD':('Bitcoin / USD (Kraken)','Crypto','USD','both','daily'),
+ 'KRAKEN_ETHUSD':('Ethereum / USD (Kraken)','Crypto','USD','both','daily'),
+}
 MSCI={}
-CAT={**FRED,**MSCI}
-WEIGHTS={'Equity indices':18,'International indices':10,'Rates':20,'Macro':12,'Inflation':14,'FX':10,'Commodities':12,'Housing':7,'Individual stocks':20,'Bond indices':6,'Crypto':4}
+CAT={**FRED,**STOOQ,**CRYPTO}
+WEIGHTS={'Equity indices':18,'International indices':10,'Rates':20,'Macro':12,'Inflation':14,'FX':10,'Commodities':12,'Housing':7,'Individual stocks':20,'Bond indices':6,'Crypto':4,'International ETFs':10,'Bond ETFs':6,'Commodity ETFs':5}
 LOCK=threading.RLock()
 
 def conn():
@@ -127,6 +166,49 @@ def fred_fetch(series,key):
    except (ValueError,KeyError):pass
   return rows
  raise ValueError('FRED_API_KEY is required; configure it as a server-side environment variable')
+
+def stooq_fetch(symbol,key):
+ if not key:raise ValueError('STOOQ_API_KEY not configured; get download access from Stooq')
+ qs=urllib.parse.urlencode({'s':symbol.lower()+'.us','i':'d','d1':'20000101','d2':date.today().strftime('%Y%m%d'),'apikey':key})
+ req=urllib.request.Request('https://stooq.com/q/d/l/?'+qs,headers={'User-Agent':'financia.le personal research contact via site'})
+ with urllib.request.urlopen(req,timeout=30) as r:content=r.read(8_000_000)
+ if not content.startswith(b'Date,'):raise ValueError('Stooq did not return daily-price CSV (check key, symbol or quota)')
+ return parse_csv(content,symbol)
+
+def kraken_fetch(pair):
+ # Kraken public OHLC returns a limited recent window, not a complete historical archive.
+ qs=urllib.parse.urlencode({'pair':pair,'interval':1440})
+ req=urllib.request.Request('https://api.kraken.com/0/public/OHLC?'+qs,headers={'User-Agent':'financia.le personal game'})
+ with urllib.request.urlopen(req,timeout=25) as r:data=json.load(r)
+ if data.get('error'):raise ValueError(str(data['error']))
+ result=data.get('result',{});keys=[k for k in result if k!='last']
+ if len(keys)!=1:raise ValueError('Unexpected Kraken OHLC response')
+ out=[];today=datetime.now(ZoneInfo('UTC')).date()
+ for x in result[keys[0]]:
+  d=datetime.fromtimestamp(int(x[0]),ZoneInfo('UTC')).date()
+  if d>=today:continue # exclude still-forming daily candle
+  v=float(x[4])
+  if v>0 and math.isfinite(v):out.append((d.isoformat(),v))
+ return out
+
+def fetch_extra():
+ results=[];key=os.getenv('STOOQ_API_KEY','').strip()
+ if key:
+  for sid in STOOQ:
+   ticker=sid.split('_',1)[1]
+   try:
+    rows=stooq_fetch(ticker,key)
+    if len(rows)<30:raise ValueError('Too few historical observations')
+    results.append({'series':sid,'count':store(sid,rows,'Stooq daily Close (adjustment not guaranteed)'),'ok':True})
+   except Exception as e:results.append({'series':sid,'ok':False,'error':str(e)[:170]})
+   time.sleep(.25)
+ for sid,pair in [('KRAKEN_BTCUSD','XBTUSD'),('KRAKEN_ETHUSD','ETHUSD')]:
+  try:
+   rows=kraken_fetch(pair)
+   if len(rows)<30:raise ValueError('Too few Kraken observations')
+   results.append({'series':sid,'count':store(sid,rows,'Kraken UTC daily close'),'ok':True})
+  except Exception as e:results.append({'series':sid,'ok':False,'error':str(e)[:170]})
+ return results
 
 def fetch_all():
  key=os.getenv('FRED_API_KEY','').strip();results=[]
@@ -194,14 +276,14 @@ def question_for(s,rows,slot,day):
   answer=endval;typ='rate_level' if unit=='%' else 'level';ansunit=unit
  # Important: no time-travel for revised macro data: current vintage is used, game frozen.
  if not math.isfinite(answer):return None
- if typ=='daily_return':tol=.25 if group in ('Equity indices','International indices') else 1.0
+ if typ=='daily_return':tol=.25 if group in ('Equity indices','International indices','Individual stocks','International ETFs','Bond ETFs','Commodity ETFs') else 1.0
  elif typ in ('period_return','calculated_change'):
   tol={2:2,3:4,4:6,5:15}.get(slot,2)
   if group=='Inflation':tol={2:.3,3:.4,4:.7,5:2}.get(slot,.4)
   if group=='Macro':tol={2:1,3:2,4:3,5:6}.get(slot,2)
   if group=='Housing':tol={2:.5,3:2,4:4,5:12}.get(slot,2)
   if group=='FX':tol*=.65
-  if group=='Commodities':tol*=1.7
+  if group in ('Commodities','Commodity ETFs','Crypto'):tol*=1.7
  elif typ=='rate_level':tol=.5
  else:tol=max(abs(answer)*(.10 if group in ('Commodities','Crypto') else .07),.0001)
  if slot==1:question=f'What was the {name} return on {enddate.strftime("%b %-d, %Y")}?'
@@ -217,14 +299,14 @@ def question_for(s,rows,slot,day):
  return {'slot':slot,'series':s,'name':name,'group':group,'question':question,'type':typ,'unit':ansunit,'answer':answer,'display':round(answer,2 if ansunit=='%' else (4 if group=='FX' else 2)),'precision':2 if ansunit=='%' else (4 if group=='FX' else 2),'tolerance':tol,'end':enddate.isoformat(),'start':start.isoformat() if start else None,'endValue':endval,'startValue':startval,'chart':chart,'source':None}
 
 def generate(day,mode):
- storage_mode='v2-latest-end-'+mode
+ storage_mode='v3-expanded-'+mode
  with LOCK:
   c=conn()
   try:
    saved=c.execute('SELECT payload FROM games WHERE day=? AND mode=?',(day.isoformat(),storage_mode)).fetchone()
    if saved:return json.loads(saved['payload'])
    pools={};cache={}
-   for s in CAT:
+   for s in (CAT if mode=='real' else FRED):
     if mode=='real':rows=series_rows(c,s,day)
     else:rows=fixture_rows(s,day)
     if len(rows)<3:continue
@@ -245,13 +327,13 @@ def generate(day,mode):
      pool.append((q,weight))
     if not pool:raise ValueError(f'No eligible real-data questions for Q{slot}. Refresh FRED data or import historical CSVs.')
     pools[slot]=pool
-   rng=random.Random(f'financia.le-v2:{mode}:{day.isoformat()}')
+   rng=random.Random(f'financia.le-v3:{mode}:{day.isoformat()}')
    questions=[]
    for slot in range(1,6):
     pool=pools[slot];q=rng.choices([x[0] for x in pool],weights=[x[1] for x in pool],k=1)[0]
-    q['source']='SIMULATED DEMO' if mode=='demo' else ('OECD via FRED (national index, local-market basis)' if q['series'] in INTERNATIONAL else 'FRED (source series: '+q['series']+')')
+    q['source']='SIMULATED DEMO' if mode=='demo' else ('Stooq daily Close (not guaranteed dividend-adjusted)' if q['series'] in STOOQ else 'Kraken UTC daily close' if q['series'] in CRYPTO else 'OECD via FRED (national index, local-market basis)' if q['series'] in INTERNATIONAL else 'FRED (source series: '+q['series']+')')
     questions.append(q)
-   result={'date':day.isoformat(),'mode':mode,'questions':questions,'created':iso_now(),'version':2}
+   result={'date':day.isoformat(),'mode':mode,'questions':questions,'created':iso_now(),'version':3}
    c.execute('INSERT INTO games VALUES(?,?,?,?)',(day.isoformat(),storage_mode,json.dumps(result,allow_nan=False),iso_now()));c.commit()
    return result
   finally:c.close()
@@ -260,7 +342,7 @@ def status():
  c=conn()
  try:
   rows=c.execute('SELECT series,COUNT(*) n,MIN(day) first,MAX(day) last FROM observations GROUP BY series').fetchall()
-  return {'series':[dict(r) for r in rows],'seriesCount':len(rows),'internationalCount':sum(1 for r in rows if r['series'] in INTERNATIONAL),'fredKey':bool(os.getenv('FRED_API_KEY')),'today':game_day().isoformat()}
+  return {'series':[dict(r) for r in rows],'seriesCount':len(rows),'internationalCount':sum(1 for r in rows if r['series'] in INTERNATIONAL),'fredKey':bool(os.getenv('FRED_API_KEY')),'stooqKey':bool(os.getenv('STOOQ_API_KEY')),'stockCount':sum(1 for r in rows if r['series'].startswith('STOCK_')),'etfCount':sum(1 for r in rows if r['series'].startswith('ETF_')),'cryptoCount':sum(1 for r in rows if r['series'].startswith('KRAKEN_')),'today':game_day().isoformat()}
  finally:c.close()
 
 class Handler(BaseHTTPRequestHandler):
@@ -299,7 +381,7 @@ class Handler(BaseHTTPRequestHandler):
  def do_POST(self):
   if not self.require_auth():return
   if self.path!='/api/admin/refresh':return self.respond({'error':'Not found'},404)
-  if not os.getenv('FRED_API_KEY'):return self.respond({'error':'FRED_API_KEY is not configured on the server'},503)
+  if not os.getenv('FRED_API_KEY') and not os.getenv('STOOQ_API_KEY'):return self.respond({'error':'Set FRED_API_KEY or STOOQ_API_KEY in the server environment'},503)
   if not REFRESH_LOCK.acquire(blocking=False):return self.respond({'error':'Refresh already running'},409)
   threading.Thread(target=refresh_worker,daemon=True).start()
   return self.respond({'ok':True,'message':'Data refresh started in background'})
@@ -307,21 +389,21 @@ class Handler(BaseHTTPRequestHandler):
 REFRESH_LOCK=threading.Lock()
 def refresh_worker():
  try:
-  result=fetch_all()
-  logging.info('FRED refresh: %s/%s succeeded',sum(x['ok'] for x in result),len(result))
+  result=(fetch_all() if os.getenv('FRED_API_KEY') else [])+fetch_extra()
+  logging.info('Market-data refresh: %s/%s succeeded',sum(x['ok'] for x in result),len(result))
   for x in result:
-   if not x['ok']:logging.warning('FRED series %s: %s',x['series'],x['error'])
+   if not x['ok']:logging.warning('Data series %s: %s',x['series'],x['error'])
  finally:REFRESH_LOCK.release()
 def periodic_refresh():
  # Also refresh on startup; generate() freezes each game only once.
  while True:
-  if os.getenv('FRED_API_KEY') and REFRESH_LOCK.acquire(blocking=False):
+  if REFRESH_LOCK.acquire(blocking=False):
    refresh_worker()
   time.sleep(24*60*60)
 
 def main():
  if len(sys.argv)>1 and sys.argv[1]=='refresh':
-  out=fetch_all()
+  out=(fetch_all() if os.getenv('FRED_API_KEY') else [])+fetch_extra()
   for r in out:print(('OK ' if r['ok'] else 'ERR ')+r['series']+': '+str(r.get('count',r.get('error'))))
   print(f"{sum(x['ok'] for x in out)}/{len(out)} series refreshed")
   return

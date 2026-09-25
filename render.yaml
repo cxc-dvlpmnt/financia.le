@@ -15,5 +15,7 @@ services:
         sync: false
       - key: FRED_API_KEY
         sync: false
+      - key: STOOQ_API_KEY
+        sync: false
       - key: PYTHONUNBUFFERED
         value: "1"
